@@ -18,7 +18,7 @@
 """
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 
@@ -187,6 +187,53 @@ def fetch_prices(codes):
 
 # ── 历史价（期初价 / 观察日收盘） ─────────────────────────
 
+def _eastmoney_secids(code, cat):
+    """东方财富 secid 列表"""
+    if cat == "gold":
+        return ["118.AU9999", "113.AU9999"]
+    if cat == "futures":
+        return [f"113.{code}"]
+    if cat == "index":
+        return [f"1.{code}"]  # 沪市指数
+    prefix = "1" if code.startswith(("5", "6")) else "0"
+    return [f"{prefix}.{code}"]
+
+
+def fetch_kline(code, start_date=None, end_date=None):
+    """获取区间日K线，返回 {date: close}，双源 fallback"""
+    cat = classify_code(code)
+    end = (end_date or _today()).replace("-", "")
+    start = (start_date or (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")).replace("-", "")
+
+    # 东方财富（支持区间，主源）
+    for secid in _eastmoney_secids(code, cat):
+        try:
+            url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get?"
+                   f"secid={secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+                   f"&klt=101&fqt=0&beg={start}&end={end}&lmt=100000")
+            klines = safe_get(url, headers={"Referer": "https://quote.eastmoney.com"}).json().get("data", {}).get("klines", [])
+            if klines:
+                return {line.split(",")[0]: float(line.split(",")[2]) for line in klines}
+        except Exception:
+            continue
+
+    # 新浪（备源，取最近 N 天）
+    try:
+        if cat == "futures":
+            url = ("https://stock2.finance.sina.com.cn/futures/api/json_v2.php/"
+                   "IndexService.getInnerFuturesDailyKLine?symbol=" + code)
+            data = safe_get(url, headers={"Referer": "https://finance.sina.com.cn"}).json()
+            return {item.get("date"): float(item.get("close", 0)) for item in data if item.get("close")}
+        url = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+               "CN_MarketData.getKLineData?symbol=" + _sina_prefix(code, cat) + code +
+               "&scale=240&ma=no&datalen=500")
+        data = safe_get(url, headers={"Referer": "https://finance.sina.com.cn"}).json()
+        return {item.get("day"): float(item.get("close", 0)) for item in data if item.get("close")}
+    except Exception:
+        pass
+    return {}
+
+
 def fetch_initial_price(code, target_date):
     """获取历史收盘价，双源 fallback，返回 (price, actual_date)"""
     cat = classify_code(code)
@@ -211,16 +258,7 @@ def fetch_initial_price(code, target_date):
         pass
 
     # 东方财富 K线
-    if cat == "gold":
-        secids = ["118.AU9999", "113.AU9999"]
-    elif cat == "futures":
-        secids = [f"113.{code}"]
-    elif cat == "index":
-        secids = [f"1.{code}"]  # 沪市指数
-    else:
-        prefix = "1" if code.startswith(("5", "6")) else "0"
-        secids = [f"{prefix}.{code}"]
-    for secid in secids:
+    for secid in _eastmoney_secids(code, cat):
         try:
             url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get?"
                    "secid=" + secid +
