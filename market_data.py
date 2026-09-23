@@ -16,6 +16,7 @@
 
 各项目通过 git submodule 引用本模块，统一维护数据源与 fallback 策略。
 """
+import json
 import re
 import time
 from datetime import datetime, timedelta
@@ -160,6 +161,16 @@ def _fetch_eastmoney(code, cat):
 def fetch_price(code):
     """获取实时价，多源 fallback，返回 (price, date)"""
     cat = classify_code(code)
+    # 黄金：上金所官网日K的最近收盘（官方权威，原腾讯sge接口已失效）
+    if cat == "gold":
+        try:
+            klines = _fetch_sge_kline()
+            if klines:
+                day = max(klines)
+                if klines[day] > 0:
+                    return klines[day], day
+        except Exception:
+            pass
     fetchers = [
         ("新浪", lambda: _fetch_sina(code, cat)),
         ("腾讯", lambda: _fetch_tencent(code, cat)),
@@ -199,13 +210,95 @@ def _eastmoney_secids(code, cat):
     return [f"{prefix}.{code}"]
 
 
+# 进程内缓存：同一标的在一轮任务里会被敲出检测/结算重复拉取，
+# SGE 官网对突发请求有拦截窗口，必须整轮只请求一次
+_KLINE_CACHE = {}
+_SGE_SESSION = requests.Session()  # 会话内先访问页面取 cookie，绕过 WAF 对裸 POST 的拦截
+
+
+def _fetch_sge_kline(instid="Au99.99"):
+    """上海黄金交易所官网日K历史（2026年起新浪/东财/腾讯的SGE源陆续失效），
+    POST /graph/Dailyhq，返回 {date: close}"""
+    if ("sge", instid) in _KLINE_CACHE:
+        return _KLINE_CACHE[("sge", instid)]
+    try:
+        _SGE_SESSION.get("https://www.sge.com.cn/sjzx/mrhq", headers={"User-Agent": UA}, timeout=15)
+    except Exception:
+        pass
+    last_err = None
+    for i in range(4):
+        try:
+            r = _SGE_SESSION.post(
+                "https://www.sge.com.cn/graph/Dailyhq",
+                data={"instid": instid},
+                headers={
+                    "User-Agent": UA,
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Origin": "https://www.sge.com.cn",
+                    "Referer": "https://www.sge.com.cn/sjzx/mrhq",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                timeout=15,
+            )
+            rows = r.json().get("time") or []
+            result = {str(row[0])[:10]: float(row[2]) for row in rows if len(row) >= 3 and float(row[2]) > 0}
+            if not result:
+                raise RuntimeError("SGE 返回空数据")
+            _KLINE_CACHE[("sge", instid)] = result
+            return result
+        except Exception as e:
+            last_err = e
+            if i < 3:
+                time.sleep(2 ** i)
+    raise RuntimeError(f"SGE Dailyhq 失败: {last_err}")
+
+
+def _fetch_sina_futures2_kline(code):
+    """新浪期货日K新接口（旧 getInnerFuturesDailyKLine 2026-09 起对部分合约返回空），
+    jsonp 格式，返回 {date: close}"""
+    if ("sina2", code) in _KLINE_CACHE:
+        return _KLINE_CACHE[("sina2", code)]
+    url = ("https://stock2.finance.sina.com.cn/futures/api/jsonp.php/"
+           "var%20t=/InnerFuturesNewService.getDailyKLine?symbol=" + code)
+    r = safe_get(url, headers={"Referer": "https://finance.sina.com.cn"})
+    m = re.search(r"\((\[.*\])\)", r.text, re.S)
+    if not m:
+        result = {}
+    else:
+        result = {item["d"]: float(item["c"]) for item in json.loads(m.group(1)) if item.get("c")}
+    _KLINE_CACHE[("sina2", code)] = result
+    return result
+
+
 def fetch_kline(code, start_date=None, end_date=None):
-    """获取区间日K线，返回 {date: close}，双源 fallback"""
+    """获取区间日K线，返回 {date: close}，多源 fallback"""
     cat = classify_code(code)
     end = (end_date or _today()).replace("-", "")
     start = (start_date or (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")).replace("-", "")
 
-    # 东方财富（支持区间，主源）
+    def _in_range(klines):
+        return {d: c for d, c in klines.items()
+                if start.replace("-", "") <= d.replace("-", "") <= end.replace("-", "")}
+
+    # 上海黄金交易所官网（黄金主源）
+    if cat == "gold":
+        try:
+            klines = _in_range(_fetch_sge_kline())
+            if klines:
+                return klines
+        except Exception:
+            pass
+
+    # 新浪期货日K新接口（期货主源，含完整历史）
+    if cat == "futures":
+        try:
+            klines = _in_range(_fetch_sina_futures2_kline(code))
+            if klines:
+                return klines
+        except Exception:
+            pass
+
+    # 东方财富（支持区间，原主源，保留为备源）
     for secid in _eastmoney_secids(code, cat):
         try:
             url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get?"
@@ -235,11 +328,31 @@ def fetch_kline(code, start_date=None, end_date=None):
 
 
 def fetch_initial_price(code, target_date):
-    """获取历史收盘价，双源 fallback，返回 (price, actual_date)"""
+    """获取历史收盘价，多源 fallback，返回 (price, actual_date)"""
     cat = classify_code(code)
     target = str(target_date)[:10]
 
-    # 新浪 K线
+    # 上海黄金交易所官网（黄金主源）
+    if cat == "gold":
+        try:
+            klines = _fetch_sge_kline()
+            for day in sorted(klines, reverse=True):
+                if day <= target:
+                    return klines[day], day
+        except Exception:
+            pass
+
+    # 新浪期货日K新接口（期货主源）
+    if cat == "futures":
+        try:
+            klines = _fetch_sina_futures2_kline(code)
+            for day in sorted(klines, reverse=True):
+                if day <= target:
+                    return klines[day], day
+        except Exception:
+            pass
+
+    # 新浪 K线（原主源，保留为备源）
     try:
         if cat == "futures":
             url = ("https://stock2.finance.sina.com.cn/futures/api/json_v2.php/"
